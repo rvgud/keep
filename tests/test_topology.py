@@ -1,9 +1,11 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import pytest
 from sqlmodel import select
+from unittest.mock import patch
 
 from keep.api.core.dependencies import SINGLE_TENANT_UUID
+from keep.api.models.db.alert import Alert, LastAlert, Incident
 from keep.api.models.db.topology import (
     TopologyApplication,
     TopologyApplicationDtoIn,
@@ -17,6 +19,7 @@ from keep.topologies.topologies_service import (
     InvalidApplicationDataException,
     ServiceNotFoundException,
 )
+from keep.topologies.topology_processor import TopologyProcessor
 from tests.fixtures.client import setup_api_key, client, test_app  # noqa: F401
 
 
@@ -387,3 +390,147 @@ def test_import_to_db(db_session):
         assert len(dependencies) == 1
         assert dependencies[0].service_id == 1
         assert dependencies[0].depends_on_service_id == 2
+
+
+def test_create_application_based_incident_with_flush(db_session):
+    """
+    Test that verifies the session.flush() changes in _create_application_based_incident
+    don't break the incident creation flow.
+
+    This test ensures:
+    1. Incident is created successfully
+    2. Incident is flushed to the database before alert assignment
+    3. Alerts can be assigned to the flushed incident
+    4. Workflow events are triggered correctly
+    """
+    # Setup: Create services and application
+    tenant_id = SINGLE_TENANT_UUID
+
+    service_1 = create_service(db_session, tenant_id, "service_1")
+    service_2 = create_service(db_session, tenant_id, "service_2")
+
+    application = TopologyApplication(
+        tenant_id=tenant_id,
+        name="Test Application for Incident",
+        services=[service_1, service_2],
+    )
+    db_session.add(application)
+    db_session.commit()
+    db_session.refresh(application)
+
+    # Create alerts for the services
+    def _create_test_event(fingerprint, service_name):
+        return {
+            "id": str(uuid.uuid4()),
+            "name": f"test-alert-{service_name}",
+            "status": "firing",
+            "lastReceived": datetime.now(tz=timezone.utc).isoformat(),
+            "service": service_name,
+        }
+
+    alert_1 = Alert(
+        tenant_id=tenant_id,
+        provider_type="test",
+        provider_id="test_provider",
+        event=_create_test_event("alert-1", "service_1"),
+        fingerprint="test-alert-1",
+    )
+    alert_2 = Alert(
+        tenant_id=tenant_id,
+        provider_type="test",
+        provider_id="test_provider",
+        event=_create_test_event("alert-2", "service_2"),
+        fingerprint="test-alert-2",
+    )
+
+    db_session.add_all([alert_1, alert_2])
+    db_session.commit()
+
+    # Create LastAlert records (required for alert assignment)
+    last_alert_1 = LastAlert(
+        tenant_id=tenant_id,
+        fingerprint="test-alert-1",
+        timestamp=alert_1.timestamp,
+        first_timestamp=alert_1.timestamp,
+        alert_id=alert_1.id,
+    )
+    last_alert_2 = LastAlert(
+        tenant_id=tenant_id,
+        fingerprint="test-alert-2",
+        timestamp=alert_2.timestamp,
+        first_timestamp=alert_2.timestamp,
+        alert_id=alert_2.id,
+    )
+    db_session.add_all([last_alert_1, last_alert_2])
+    db_session.commit()
+
+    # Convert to AlertDto format
+    from keep.api.utils.enrichment_helpers import convert_db_alerts_to_dto_alerts
+    alert_dtos = convert_db_alerts_to_dto_alerts([alert_1, alert_2])
+
+    services_with_alerts = {
+        "service_1": [alert_dtos[0]],
+        "service_2": [alert_dtos[1]],
+    }
+
+    # Verify no incidents exist before the test
+    incidents_before = db_session.exec(
+        select(Incident).where(Incident.tenant_id == tenant_id)
+    ).all()
+    assert len(incidents_before) == 0
+
+    # Mock the workflow event to prevent side effects
+    with patch("keep.topologies.topology_processor.RulesEngine.send_workflow_event") as mock_workflow:
+        # Create the topology processor and call the method
+        processor = TopologyProcessor()
+
+        # Call the method that contains the session.flush() changes
+        processor._create_application_based_incident(
+            tenant_id=tenant_id,
+            application=application,
+            services_with_alerts=services_with_alerts,
+        )
+
+        # Verify workflow event was called
+        assert mock_workflow.call_count == 1
+        call_args = mock_workflow.call_args
+        assert call_args[0][0] == tenant_id
+        assert call_args[0][2].user_generated_name == f"Application incident: {application.name}"
+        assert call_args[0][3] == "created"
+
+    # Verify incident was created
+    incidents_after = db_session.exec(
+        select(Incident).where(Incident.tenant_id == tenant_id)
+    ).all()
+    assert len(incidents_after) == 1
+
+    incident = incidents_after[0]
+    assert incident.user_generated_name == f"Application incident: {application.name}"
+    assert incident.user_summary == f"Multiple services in application {application.name} are experiencing issues"
+    assert incident.incident_type == "topology"
+    assert incident.incident_application == application.id
+    assert incident.is_candidate is False
+    assert incident.is_visible is True
+
+    # Verify alerts are assigned to the incident
+    # Refresh the incident to get the latest data with relationships
+    db_session.refresh(incident)
+
+    # Query incident-alert relationships
+    from keep.api.models.db.alert import AlertToIncident
+    incident_alerts = db_session.exec(
+        select(AlertToIncident).where(AlertToIncident.incident_id == incident.id)
+    ).all()
+
+    # Verify both alerts are assigned to the incident
+    assert len(incident_alerts) == 2
+    assigned_alert_ids = {ia.alert_id for ia in incident_alerts}
+    assert alert_1.id in assigned_alert_ids
+    assert alert_2.id in assigned_alert_ids
+
+    # Verify the incident can be queried and is properly persisted
+    queried_incident = db_session.exec(
+        select(Incident).where(Incident.id == incident.id)
+    ).first()
+    assert queried_incident is not None
+    assert queried_incident.id == incident.id
